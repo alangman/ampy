@@ -17,7 +17,7 @@ Or:
 
 Then:
 
-    pyb.enter_raw_repl()
+    pyb.enter_raw_repl(
     pyb.exec('pyb.LED(1).on()')
     pyb.exit_raw_repl()
 
@@ -127,49 +127,35 @@ class Pyboard:
             self.serial = TelnetToSerial(device, user, password, read_timeout=10)
         else:
             import serial
-            delayed = False
-            for attempt in range(wait + 1):
-                try:
-                    self.serial = serial.Serial(device, baudrate=baudrate, interCharTimeout=1)
-                    break
-                except (OSError, IOError): # Py2 and Py3 have different errors
-                    if wait == 0:
-                        continue
-                    if attempt == 0:
-                        sys.stdout.write('Waiting {} seconds for pyboard '.format(wait))
-                        delayed = True
-                time.sleep(1)
-                sys.stdout.write('.')
-                sys.stdout.flush()
-            else:
-                if delayed:
-                    print('')
-                raise PyboardError('failed to access ' + device)
-            if delayed:
-                print('')
+            try:
+                self.serial = serial.serial_for_url(device,do_not_open=True)
+                self.serial.baudrate=115200
+                self.serial.timeout = 1  #Read timeout
+                self.serial.write_timeout = 1
+                self.serial.inter_byte_timeout = None
+                self.serial.rts=0
+                self.serial.dtr=0
+                self.serial.inter_byte_timeout=1
+                self.open()
+            except ValueError:
+                print("Serial Parameters out of range")
+            except serial.SerialException:
+                print("Serial device could not be found or configured")
+
+    def open(self):
+        try:
+            self.serial.open()
+        except self.serial.SerialException:
+            print("Serial port could not be opened")
 
     def close(self):
         self.serial.close()
 
+
     def read_until(self, min_num_bytes, ending, timeout=10, data_consumer=None):
-        data = self.serial.read(min_num_bytes)
+        data = self.serial.read_until(ending)
         if data_consumer:
             data_consumer(data)
-        timeout_count = 0
-        while True:
-            if data.endswith(ending):
-                break
-            elif self.serial.inWaiting() > 0:
-                new_data = self.serial.read(1)
-                data = data + new_data
-                if data_consumer:
-                    data_consumer(new_data)
-                timeout_count = 0
-            else:
-                timeout_count += 1
-                if timeout is not None and timeout_count >= 100 * timeout:
-                    break
-                time.sleep(0.01)
         return data
 
     def enter_raw_repl(self):
@@ -179,37 +165,16 @@ class Pyboard:
 
         self.serial.write(b'\r\x03\x03') # ctrl-C twice: interrupt any running program
 
-        # flush input (without relying on serial.flushInput())
-        n = self.serial.inWaiting()
-        while n > 0:
-            self.serial.read(n)
-            n = self.serial.inWaiting()
+        self.serial.flushInput()
 
         self.serial.write(b'\r\x01') # ctrl-A: enter raw REPL
-        data = self.read_until(1, b'raw REPL; CTRL-B to exit\r\n>')
-        if not data.endswith(b'raw REPL; CTRL-B to exit\r\n>'):
-            print(data)
-            raise PyboardError('could not enter raw repl')
-
-        self.serial.write(b'\x04') # ctrl-D: soft reset
-        data = self.read_until(1, b'soft reboot\r\n')
-        if not data.endswith(b'soft reboot\r\n'):
-            print(data)
-            raise PyboardError('could not enter raw repl')
-        # By splitting this into 2 reads, it allows boot.py to print stuff,
-        # which will show up after the soft reboot and before the raw REPL.
-        # Modification from original pyboard.py below:
-        #   Add a small delay and send Ctrl-C twice after soft reboot to ensure
-        #   any main program loop in main.py is interrupted.
-        time.sleep(0.5)
-        self.serial.write(b'\x03')
-        time.sleep(0.1)           # (slight delay before second interrupt
-        self.serial.write(b'\x03')
-        # End modification above.
         data = self.read_until(1, b'raw REPL; CTRL-B to exit\r\n')
         if not data.endswith(b'raw REPL; CTRL-B to exit\r\n'):
-            print(data)
             raise PyboardError('could not enter raw repl')
+        if not self.isPrompt:
+           raise PyboardError('could not enter raw repl')
+        self.serial.flushInput()
+        
 
     def exit_raw_repl(self):
         self.serial.write(b'\r\x02') # ctrl-B: enter friendly REPL
@@ -217,6 +182,7 @@ class Pyboard:
     def follow(self, timeout, data_consumer=None):
         # wait for normal output
         data = self.read_until(1, b'\x04', timeout=timeout, data_consumer=data_consumer)
+
         if not data.endswith(b'\x04'):
             raise PyboardError('timeout waiting for first EOF reception')
         data = data[:-1]
@@ -226,6 +192,8 @@ class Pyboard:
         if not data_err.endswith(b'\x04'):
             raise PyboardError('timeout waiting for second EOF reception')
         data_err = data_err[:-1]
+
+        self.serial.flushInput()
 
         # return normal and error output
         return data, data_err
@@ -237,9 +205,7 @@ class Pyboard:
             command_bytes = bytes(command, encoding='utf8')
 
         # check we have a prompt
-        data = self.read_until(1, b'>')
-        if not data.endswith(b'>'):
-            raise PyboardError('could not enter raw repl')
+       
 
         # write command
         for i in range(0, len(command_bytes), 256):
@@ -253,8 +219,9 @@ class Pyboard:
             raise PyboardError('could not exec command')
 
     def exec_raw(self, command, timeout=10, data_consumer=None):
-        self.exec_raw_no_follow(command);
-        return self.follow(timeout, data_consumer)
+        self.exec_raw_no_follow(command)
+        output = self.follow(timeout, data_consumer)
+        return output
 
     def eval(self, expression):
         ret = self.exec_('print({})'.format(expression))
@@ -275,12 +242,19 @@ class Pyboard:
     def get_time(self):
         t = str(self.eval('pyb.RTC().datetime()'), encoding='utf8')[1:-1].split(', ')
         return int(t[4]) * 3600 + int(t[5]) * 60 + int(t[6])
+    
+    def isPrompt(self):
+        data = self.serial.read_all()
+        if data == b'>':
+            return True
+        else:
+            return False
 
 # in Python2 exec is a keyword so one must use "exec_"
 # but for Python3 we want to provide the nicer version "exec"
 setattr(Pyboard, "exec", Pyboard.exec_)
 
-def execfile(filename, device='/dev/ttyACM0', baudrate=115200, user='micro', password='python'):
+def execfile(filename, device='/dev/ttyUSB0', baudrate=115200, user='micro', password='python'):
     pyb = Pyboard(device, baudrate, user, password)
     pyb.enter_raw_repl()
     output = pyb.execfile(filename)
@@ -289,7 +263,7 @@ def execfile(filename, device='/dev/ttyACM0', baudrate=115200, user='micro', pas
     pyb.close()
 
 def main():
-    import argparse
+    import argparse,time
     cmd_parser = argparse.ArgumentParser(description='Run scripts on the pyboard.')
     cmd_parser.add_argument('--device', default='/dev/ttyACM0', help='the serial device or the IP address of the pyboard')
     cmd_parser.add_argument('-b', '--baudrate', default=115200, help='the baud rate of the serial device')
@@ -304,8 +278,13 @@ def main():
     def execbuffer(buf):
         try:
             pyb = Pyboard(args.device, args.baudrate, args.user, args.password, args.wait)
+            time.sleep(1)
             pyb.enter_raw_repl()
-            ret, ret_err = pyb.exec_raw(buf, timeout=None, data_consumer=stdout_write_bytes)
+            if args.follow:
+                data_consumer = stdout_write_bytes
+            else:
+                data_consumer=None
+            ret, ret_err = pyb.exec_raw(buf, timeout=None, data_consumer=data_consumer)
             pyb.exit_raw_repl()
             pyb.close()
         except PyboardError as er:
@@ -325,19 +304,19 @@ def main():
             pyfile = f.read()
             execbuffer(pyfile)
 
-    if args.follow or (args.command is None and len(args.files) == 0):
-        try:
-            pyb = Pyboard(args.device, args.baudrate, args.user, args.password, args.wait)
-            ret, ret_err = pyb.follow(timeout=None, data_consumer=stdout_write_bytes)
-            pyb.close()
-        except PyboardError as er:
-            print(er)
-            sys.exit(1)
-        except KeyboardInterrupt:
-            sys.exit(1)
-        if ret_err:
-            stdout_write_bytes(ret_err)
-            sys.exit(1)
+    #if args.follow or (args.command is None and len(args.files) == 0):
+    #    try:
+    #        pyb = Pyboard(args.device, args.baudrate, args.user, args.password, args.wait)
+    #        ret, ret_err = pyb.follow(timeout=None, data_consumer=stdout_write_bytes)
+    #        pyb.close()
+    #    except PyboardError as er:
+    #        print(er)
+    #        sys.exit(1)
+    #    except KeyboardInterrupt:
+    #        sys.exit(1)
+    ##    if ret_err:
+    #        stdout_write_bytes(ret_err)
+    #        sys.exit(1)
 
 if __name__ == "__main__":
     main()
